@@ -1,49 +1,82 @@
-name: Build Windows Installer from ZIP
+# Builds the Windows installer (.exe) from the newest Step zip in this repository.
+# Runs automatically whenever a .zip file is uploaded/changed, or manually from the Actions tab.
+name: Build Windows Installer
 
 on:
-  workflow_dispatch:
   push:
     paths:
-      - '*.zip'
+      - '**.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 60
 
-      - name: Extract project ZIP
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@v5
+
+      - name: Find and extract the newest Step zip
+        id: src
         shell: pwsh
         run: |
-          $zip = Get-ChildItem -Path . -Filter *.zip -File | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $zip) { throw "Repository root-এ কোনো zip ফাইল পাওয়া যায়নি" }
-          Write-Host "Using: $($zip.Name)"
-          $dest = Join-Path $env:RUNNER_TEMP "proj"
-          Expand-Archive -Path $zip.FullName -DestinationPath $dest -Force
-          $pkg = Get-ChildItem -Path $dest -Recurse -Filter package.json -File |
-                 Where-Object { $_.FullName -notmatch 'node_modules' } |
-                 Sort-Object { $_.FullName.Length } | Select-Object -First 1
-          if (-not $pkg) { throw "zip-এর ভিতরে package.json পাওয়া যায়নি" }
-          $dir = $pkg.DirectoryName -replace '\\','/'
-          "PROJECT_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $zips = Get-ChildItem -Path . -Recurse -Filter *.zip -File
+          if (-not $zips) { throw "No .zip file found in the repository. Upload the Step zip first." }
 
-      - uses: actions/setup-node@v4
+          # Highest step number wins (Step01 < Step02 ...); ties are broken by file name.
+          $zip = $zips |
+            Sort-Object @{ Expression = { if ($_.BaseName -match 'Step0*(\d+)') { [int]$Matches[1] } else { 0 } } }, Name |
+            Select-Object -Last 1
+          Write-Host "Using zip: $($zip.FullName)"
+
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath _extract -Force
+
+          $tauri = Get-ChildItem -Path _extract -Recurse -Directory -Filter src-tauri |
+            Where-Object { $_.FullName -notmatch 'node_modules' } |
+            Select-Object -First 1
+          if (-not $tauri) { throw "The zip does not contain a 'src-tauri' folder, so it is not the app project." }
+
+          Move-Item -LiteralPath $tauri.Parent.FullName -Destination app
+          Write-Host "Project root moved to .\app"
+
+          $safeName = $zip.BaseName -replace '[^A-Za-z0-9_.-]', '_'
+          "name=$safeName" >> $env:GITHUB_OUTPUT
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 'lts/*'
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Cache Rust build (makes later builds faster)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'app/src-tauri -> target'
+
+      - name: Install app dependencies
+        working-directory: app
         run: npm install
 
-      - name: Build app
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: npm run tauri build
+      - name: Build the installer
+        working-directory: app
+        run: npx tauri build
 
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
+      - name: Upload the installer
+        uses: actions/upload-artifact@v5
         with:
-          name: Windows-Installer
-          path: ${{ env.PROJECT_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
+          name: ${{ steps.src.outputs.name }}_Windows_Installer
+          path: |
+            app/src-tauri/target/release/bundle/nsis/*.exe
+            app/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
+          retention-days: 30
